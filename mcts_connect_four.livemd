@@ -1,0 +1,335 @@
+# MCTS - ConnectFour
+
+```elixir
+Mix.install([
+  {:bumblebee, "~> 0.6.3"},
+  {:nx, "~> 0.10.0"},
+  {:axon, "~> 0.7.0"},
+  {:kino, "~> 0.19.0"},
+  {:torchx, "~> 0.10.0"},
+  {:uuid, "~> 1.1"}
+])
+```
+
+## Section
+
+```elixir
+Nx.default_backend(Torchx.Backend)
+```
+
+## Game Board
+
+```elixir
+defmodule GameBoard do
+  use GenServer
+  
+  @row_count 6
+  @col_count 7
+  # @action_size 7
+  # @in_a_row 4
+
+  @fields [:board]
+  @type t :: %__MODULE__{
+    board: Nx.Tensor.t()  
+  }
+  
+  defstruct @fields
+
+  def start_link() do
+    GenServer.start_link(__MODULE__, %{}, name: __MODULE__)
+  end
+
+  def get_state() do
+    GenServer.call(__MODULE__, :get_state)
+  end
+  
+  def save_board(board) do
+    GenServer.cast(__MODULE__, {:save, board})
+  end
+  
+  def create_new_board() do
+    Nx.broadcast(0, {@row_count, @col_count})
+  end
+
+  def change_perspective(board, player) do
+    board |> Nx.multiply(player)
+  end
+  
+  def get_row_count, do: @row_count
+  def get_col_count, do: @col_count
+  
+  def play_move(board, col, player_id) do
+    row_indices = Nx.iota({@row_count})
+    
+    row =
+      Nx.slice_along_axis(board, col, 1, axis: 1)
+      |> Nx.flatten()
+      |> Nx.equal(0)
+      |> Nx.multiply(row_indices)
+      |> Nx.reduce_max()
+      |> Nx.to_number()
+    
+    indices = Nx.tensor([[row, col]])
+    updates = Nx.tensor([player_id], type: Nx.type(board))
+    
+    board = Nx.indexed_put(board, indices, updates)
+    
+    save_board(board)
+  end  
+
+  def get_valid_move(), do: true
+
+  def check_win(), do: false
+
+  def get_value_and_terminated(), do: false
+
+  
+  @impl true
+  def init(state) do
+    {:ok, state}
+  end
+
+  @impl true
+  def handle_cast({:save, value}, state) do
+    new_state =
+      state
+      |> Map.put(:board, value)
+    
+    {:noreply, new_state}
+  end
+
+  @impl true
+  def handle_call(:get_state, _from, state) do
+    {:reply, state, state}
+  end
+end
+```
+
+## MCTS
+
+```elixir
+defmodule GameNode do
+  use GenServer
+
+  @fields [:board, :parent, :action_taken, :prior, :children, :visit_count, :value_sum]
+  @type t :: %__MODULE__{
+    board: Nx.Tensor.t(),
+    parent: integer(),
+    action_taken: integer(),
+    prior: integer(),
+    children: list(),
+    visit_count: integer(),
+    value_sum: integer()
+  }
+  
+  defstruct @fields
+
+  def start_link(args) do
+    uuid = UUID.uuid4()
+    GenServer.start_link(__MODULE__, args, name: {:global, uuid})
+  end
+
+  def get_state(uuid) do
+    GenServer.call(uuid, :get_state)
+  end
+
+  @impl true
+  def init(%{board: board, visit_count: visit_count} = _args) do
+    state =
+      %{
+        board: board,
+        parent: nil,
+        action_taken: nil,
+        prior: 0,
+        visit_count: visit_count || 0,
+        children: []
+      }
+    
+    {:ok, state}
+  end
+
+  @impl true
+  def handle_cast({:save, value}, state) do
+    new_state =
+      state
+      |> Map.put(:board, value)
+    
+    {:noreply, new_state}
+  end
+
+  @impl true
+  def handle_call(:get_state, _from, state) do
+    {:reply, state, state}
+  end
+end
+```
+
+```elixir
+defmodule MCTS do
+  # args = {
+  #           'num_iterations': 48,             # number of highest level iterations
+  #           'num_selfPlay_iterations': 500,   # number of self-play games to play within each iteration
+  #           'num_parallel_games': 100,        # number of games to play in parallel
+  #           'num_mcts_searches': 600,         # number of mcts simulations when selecting a move within self-play
+  #           'num_epochs': 4,                  # number of epochs for training on self-play data for each iteration
+  #           'batch_size': 128,                # batch size for training
+  #           'temperature': 1.25,                 # temperature for the softmax selection of moves
+  #           'C': 2,                      # the value of the constant policy
+  #           'augment': False,                 # whether to augment the training data with flipped states
+  #           'dirichlet_alpha': 0.3,           # the value of the dirichlet noise
+  #           'dirichlet_epsilon': 0.25,        # the value of the dirichlet noise
+  #       }
+  
+  def search(board) do
+    root = GameNode.start_link(%{board: board, visit_count: 1}
+
+    policy, _ = self.model(
+            torch.tensor(self.game.get_encoded_state(state), device=self.model.device).unsqueeze(0)
+        )
+      
+  end
+end
+```
+
+## Model ResNet
+
+```elixir
+defmodule Resnet do
+  @num_hidden 128
+  @num_res_blocks 9
+  
+  def start_block do
+    Axon.input("input", shape: {nil, 3})
+    |> Axon.conv(@num_hidden, kernel_size: 3, padding: :same)
+    |> Axon.batch_norm()
+    |> Axon.relu()
+  end
+
+  def police_head(x) do
+    x
+    |> Axon.conv(32, kernel_size: 3, padding: :same)
+    |> Axon.batch_norm()
+    |> Axon.relu()
+    |> Axon.flatten()
+    |> Axon.dense(GameBoard.get_col_count(), kernel_initializer: :lecun_normal)
+  end
+
+  def value_head(x) do
+    x
+    |> Axon.conv(3, kernel_size: 3, padding: :same)
+    |> Axon.batch_norm()
+    |> Axon.relu()
+    |> Axon.flatten()
+    |> Axon.dense(1, kernel_initializer: :lecun_normal)
+    |> Axon.tanh()
+  end
+
+  def res_block(x, num_hidden) do
+    residual = x
+  
+    x =
+      x
+      |> Axon.conv(num_hidden, kernel_size: 3, padding: :same)
+      |> Axon.batch_norm()
+      |> Axon.relu()
+      |> Axon.conv(num_hidden, kernel_size: 3, padding: :same)
+      |> Axon.batch_norm()
+  
+    x
+    |> Axon.add(residual)
+    |> Axon.relu()
+  end
+
+  def build_base_model() do
+      start_block()
+      |> then(fn input -> 
+         Enum.reduce(1..@num_res_blocks, input, fn _, acc -> 
+           res_block(acc, @num_hidden) 
+         end)
+       end)
+  end
+  
+  def build_model_policy() do
+    build_base_model() |> police_head()
+  end
+
+  def build_model_value() do
+    build_base_model() |> value_head()
+  end
+end
+  
+
+```
+
+## AlphaZero
+
+```elixir
+defmodule AlphaZero do
+  @num_interactions 48
+  
+  # def learn() do
+  #   Enum.reduce(1..@num_iterations, step, fn _, acc -> 
+  #       memory = []
+        
+  #       # self.model.eval()
+  #       # for selfPlay_iteration in trange(self.args['num_selfPlay_iterations']):
+  #       #     memory += self.selfPlay()
+            
+  #       # self.model.train()
+  #       # for epoch in trange(self.args['num_epochs']):
+  #       #     self.train(memory)
+  #   end)
+  # end
+
+  def self_play() do
+    memory = []
+    player = 1
+    board = GameBoard.create_new_board()
+
+    neutral_board = GameBoard.change_perspective(board, player)
+
+    action_probs = MCTS.
+    
+  end
+end
+```
+
+```elixir
+GameBoard.start_link()
+```
+
+```elixir
+new_board = GameBoard.create_new_board()
+```
+
+```elixir
+GameBoard.save_board(new_board)
+```
+
+```elixir
+%{board: board} = GameBoard.get_state()
+```
+
+```elixir
+AlphaZero.self_play(board)
+```
+
+```elixir
+GameBoard.play_move(board, 4, -1)
+```
+
+```elixir
+GameBoard.change_perspective(board, 1)
+```
+
+```elixir
+{:ok, pid} = GameNode.start_link(%{board: board, visit_count: 1})
+```
+
+```elixir
+GameNode.get_state(pid)
+```
+
+```elixir
+AlphaZero.self_play(board)
+```
