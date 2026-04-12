@@ -77,7 +77,20 @@ defmodule GameBoard do
     save_board(board)
   end  
 
-  def get_valid_move(), do: true
+  def get_valid_moves(board) do
+    case Nx.shape(board) do
+      {_, _row, _col} ->
+        board[[.., 0]]          # Pega todas as linhas da coluna 0
+        |> Nx.equal(0)          # Cria máscara booleana (true onde for 0)
+        |> Nx.as_type(:u8)      # Converte para unsigned integer de 8 bits (0 ou 1)
+      
+      _ ->
+        board[0]                # Acessa a primeira linha (índice 0)
+        |> Nx.equal(0)          # Compara com zero (gera booleano)
+        |> Nx.as_type(:u8)      # Converte para 1 (true) ou 0 (false)
+        
+    end
+  end
 
   def check_win(), do: false
 
@@ -166,6 +179,9 @@ end
 
 ```elixir
 defmodule MCTS do
+  @dirichlet_epsilon 0.25
+  @dirichlet_alpha 0.3
+  
   # args = {
   #           'num_iterations': 48,             # number of highest level iterations
   #           'num_selfPlay_iterations': 500,   # number of self-play games to play within each iteration
@@ -181,12 +197,70 @@ defmodule MCTS do
   #       }
   
   def search(board) do
-    root = GameNode.start_link(%{board: board, visit_count: 1}
+    root = GameNode.start_link(%{board: board, visit_count: 1})
 
-    policy, _ = self.model(
-            torch.tensor(self.game.get_encoded_state(state), device=self.model.device).unsqueeze(0)
-        )
+    # {policy, value} = 
+    #   board
+    #   |> GameBoard.get_encoded_state()
+    #   |> Nx.new_axis(0)
+    #   |> then(&predict_fn.(params, &1))
+
+    # probabilities = 
+    #   policy_logits
+    #   |> Nx.softmax(axis: 1)
+    #   |> Nx.squeeze(axes: [0])
+    #   |> Nx.to_flat_list()
+
+    # epsilon = @dirichlet_epsilon
+    # alpha = @dirichlet_alpha
+    # action_size = 7
+
+    # {gamma_samples, _new_key} = Nx.Random.gamma(key, Nx.tensor(alpha), shape: {action_size})
+    # dirichlet_noise = Nx.divide(gamma_samples, Nx.sum(gamma_samples))
+
+    # # 3. Misturar com a política original
+    # policy = 
+    #   Nx.add(
+    #     Nx.multiply(Nx.subtract(1, epsilon), policy),
+    #     Nx.multiply(epsilon, dirichlet_noise)
+    #   )
       
+        
+    #     valid_moves = GameBord.get_valid_moves(board)
+    #     policy *= valid_moves
+    #     policy /= np.sum(policy)
+    #     root.expand(policy)
+        
+    #     for search in range(self.args['num_mcts_searches']):
+    #         node = root
+            
+    #         while node.is_expanded():
+    #             node = node.select()
+                
+    #         value, is_terminal = self.game.get_value_and_terminated(node.state, node.action_taken)
+    #         value = self.game.get_opponent_value(value)
+            
+    #         if not is_terminal:
+    #             policy, value = self.model(
+    #                 torch.tensor(self.game.get_encoded_state(node.state), device=self.model.device).unsqueeze(0)
+    #             )
+    #             policy = torch.softmax(policy, axis=1).squeeze(0).cpu().numpy()
+    #             valid_moves = self.game.get_valid_moves(node.state)
+    #             policy *= valid_moves
+    #             policy /= np.sum(policy)
+                
+    #             value = value.item()
+                
+    #             node.expand(policy)
+                
+    #         node.backpropagate(value)    
+            
+    #     action_probs = np.zeros(self.game.action_size)
+    #     for child in root.children:
+    #         action_probs[child.action_taken] = child.visit_count
+    #     action_probs /= np.sum(action_probs)
+    #     return action_probs
+              
   end
 end
 ```
@@ -288,7 +362,30 @@ defmodule AlphaZero do
 
     neutral_board = GameBoard.change_perspective(board, player)
 
-    action_probs = MCTS.
+    # action_probs = MCTS.search(neutral_state)
+            
+    # memory.append((neutral_state, action_probs, player))
+    
+    # temperature_action_probs = action_probs ** (1 / self.args['temperature'])
+    # temperature_action_probs /= np.sum(temperature_action_probs)
+    # action = np.random.choice(self.game.action_size, p=temperature_action_probs)
+    
+    # state = self.game.get_next_state(state, action, player)
+    
+    # value, is_terminal = self.game.get_value_and_terminated(state, action)
+    
+    # if is_terminal:
+    #     returnMemory = []
+    #     for hist_neutral_state, hist_action_probs, hist_player in memory:
+    #         hist_outcome = value if hist_player == player else self.game.get_opponent_value(value)
+    #         returnMemory.append((
+    #             self.game.get_encoded_state(hist_neutral_state),
+    #             hist_action_probs,
+    #             hist_outcome
+    #         ))
+    #     return returnMemory
+    
+    # player = self.game.get_opponent(player)
     
   end
 end
@@ -311,7 +408,11 @@ GameBoard.save_board(new_board)
 ```
 
 ```elixir
-AlphaZero.self_play(board)
+GameBoard.get_valid_moves(board)
+```
+
+```elixir
+# AlphaZero.self_play(board)
 ```
 
 ```elixir
