@@ -26,7 +26,7 @@ defmodule GameBoard do
   @row_count 6
   @col_count 7
   # @action_size 7
-  # @in_a_row 4
+  @in_a_row 4
 
   @fields [:board]
   @type t :: %__MODULE__{
@@ -92,11 +92,89 @@ defmodule GameBoard do
     end
   end
 
-  def check_win(), do: false
+  def check_win(board, action) do
+    if is_nil(action), do: false
+        
+    # 1. Cria um vetor de índices: [0, 1, 2, 3, 4, 5]
+    row_indices = Nx.iota({6}) 
+    # 2. Pega a coluna e identifica onde NÃO está vazio
+    mask = board[[.., action]] |> Nx.not_equal(0)
+    # 3. Define um valor "infinito" (ex: 99) para células vazias
+    # para que o Nx.reduce_min não as selecione
+    row = 
+      Nx.select(mask, row_indices, 99)
+      |> Nx.reduce_min()
 
-  def get_value_and_terminated(), do: false
+    col = action
+    player = board[row][col]
 
+    # Definindo o valor necessário para ganhar (ex: 4 - 1 = 3)
+    needed = @in_a_row - 1
+    
+    # Verificamos cada eixo somando as direções opostas
+    is_win = 
+      count(board, row, action, player, 1, 0) >= needed or                          # Vertical
+      (count(board, row, action, player, 0, 1) + count(board, row, col, player, 0, -1)) >= needed or    # Horizontal
+      (count(board, row, action, player, 1, 1) + count(board, row, col, player, -1, -1)) >= needed or   # Diagonal Principal
+      (count(board, row, action, player, 1, -1) + count(board, row, col, player, -1, 1)) >= needed      # Diagonal Secundária
+
+    is_win
+  end
+
+  def count(board, row, action, player, offset_row, offset_column) do
+    # Usamos 1..(in_a_row - 1) para simular o range(1, self.in_a_row)
+    Enum.reduce_while(1..(@in_a_row - 1), 0, fn i, _acc ->
+      r = row + offset_row * i
+      c = action + offset_column * i
   
+      # Verificamos os limites e se a peça pertence ao jogador
+      if r >= 0 and r < @row_count and 
+         c >= 0 and c < @col_count and 
+         Nx.to_number(board[r][c]) == player do
+        {:cont, i} # Continua contando e atualiza o acumulador para i
+      else
+        {:halt, i - 1} # Para a execução e retorna o valor anterior
+      end
+    end)
+  end
+
+  def get_value_and_terminated(board, action) do
+    if check_win(board, action) do
+      true
+    else
+      board
+      |> get_valid_moves()      # Assume-se que retorna um tensor de 0s e 1s
+      |> Nx.sum()               # Soma todos os elementos
+      |> Nx.to_number() == 0    # Converte o tensor unitário em um número Elixir
+    end
+  end
+
+
+  def get_encoded_board(board) do
+    # 1. Cria as 3 camadas booleanas e as empilha
+    # O Nx.stack por padrão adiciona o novo eixo na posição 0
+    encoded_board = 
+      Nx.stack([
+        Nx.equal(board, -1),
+        Nx.equal(board, 0),
+        Nx.equal(board, 1)
+      ])
+      |> Nx.as_type(:f32)
+  
+    # 2. Lógica do swapaxes (se for um batch de estados)
+    if Nx.rank(board) == 3 do
+      # No NumPy: state.shape era (batch, 6, 7) -> stack criou (3, batch, 6, 7)
+      # Queremos: (batch, 3, 6, 7)
+      # No Nx, o transpose aceita a ordem dos eixos:
+      Nx.transpose(encoded_board, axes: [1, 0, 2, 3])
+    else
+      encoded_board
+    end
+  end
+  
+  def get_opponent(player), do: -player
+  def get_opponent_value(value), do: -value
+      
   @impl true
   def init(state) do
     {:ok, state}
@@ -116,6 +194,133 @@ defmodule GameBoard do
     {:reply, state, state}
   end
 end
+```
+
+## Model ResNet
+
+```elixir
+defmodule Resnet do
+  defstruct [:policy_network, :value_network, :params, :config]
+
+  @type t :: %__MODULE__{
+          policy_network: Axon.t(),
+          value_network: Axon.t(),
+          params: term() | nil,
+          config: map()
+        }
+
+  def new(config) do
+    %__MODULE__{
+      policy_network: build_policy_network(config),
+      value_network: build_value_network(config),
+      config: config
+    }
+  end
+
+  def fit(model, x, y, epochs) do
+    trained_params = trainer_fit(model.policy_network, x, y, epochs, model.config)
+    %{model | params: trained_params}
+  end
+
+  defp trainer_fit(network, x, y, epochs, config) do
+    {init_fn, _predict_fn} = Axon.build(network)
+    initial_params = init_fn.(x, Axon.ModelState.empty())
+
+    train_standard(network, x, y, epochs, initial_params, config)
+  end
+
+  defp train_standard(network, x, y, epochs, initial_params, config) do
+    network
+    |> Axon.Loop.trainer(
+      &Axon.Losses.huber(&1, &2.combined, reduction: :mean),
+      Polaris.Optimizers.adam(learning_rate: config.learning_rate)
+    )
+    |> Axon.Loop.run(Stream.repeatedly(fn -> {x, y} end), initial_params,
+      epochs: epochs,
+      iterations: elem(Nx.shape(y), 0),
+      compiler: Torchx
+    )
+  end
+  
+  defp start_block(num_hidden) do
+    Axon.input("input", shape: {nil, 3})
+    |> Axon.conv(num_hidden, kernel_size: 3, padding: :same)
+    |> Axon.batch_norm()
+    |> Axon.relu()
+  end
+
+  defp police_head(x) do
+    x
+    |> Axon.conv(32, kernel_size: 3, padding: :same)
+    |> Axon.batch_norm()
+    |> Axon.relu()
+    |> Axon.flatten()
+    |> Axon.dense(GameBoard.get_col_count(), kernel_initializer: :lecun_normal)
+  end
+
+  defp value_head(x) do
+    x
+    |> Axon.conv(3, kernel_size: 3, padding: :same)
+    |> Axon.batch_norm()
+    |> Axon.relu()
+    |> Axon.flatten()
+    |> Axon.dense(1, kernel_initializer: :lecun_normal)
+    |> Axon.tanh()
+  end
+
+  defp res_block(x, num_hidden) do
+    residual = x
+  
+    x =
+      x
+      |> Axon.conv(num_hidden, kernel_size: 3, padding: :same)
+      |> Axon.batch_norm()
+      |> Axon.relu()
+      |> Axon.conv(num_hidden, kernel_size: 3, padding: :same)
+      |> Axon.batch_norm()
+  
+    x
+    |> Axon.add(residual)
+    |> Axon.relu()
+  end
+
+  defp build_base_network(config) do
+    num_res_blocks = get_in(config, [:num_res_blocks])
+    num_hidden = get_in(config, [:num_hidden])
+
+    start_block(num_hidden)
+    |> then(fn input -> 
+       Enum.reduce(1..num_res_blocks, input, fn _, acc -> 
+         res_block(acc, num_hidden) 
+       end)
+     end)
+  end
+  
+  defp build_policy_network(config) do
+    build_base_network(config)
+    |> police_head()
+  end
+
+  defp build_value_network(config) do
+    build_base_network(config) 
+    |> value_head()
+  end
+
+
+end
+```
+
+```elixir
+model =
+  Resnet.new(%{
+    num_hidden: 128,
+    num_res_blocks: 9,
+    learning_rate: 0.01
+  })
+```
+
+```elixir
+fitted_model = Resnet.fit(model, df)
 ```
 
 ## MCTS
@@ -178,6 +383,22 @@ end
 ```
 
 ```elixir
+GameBoard.start_link()
+```
+
+```elixir
+new_board = GameBoard.create_new_board()
+```
+
+```elixir
+GameBoard.save_board(new_board)
+```
+
+```elixir
+%{board: board} = GameBoard.get_state()
+```
+
+```elixir
 defmodule MCTS do
   @dirichlet_epsilon 0.25
   @dirichlet_alpha 0.3
@@ -189,8 +410,8 @@ defmodule MCTS do
   #           'num_mcts_searches': 600,         # number of mcts simulations when selecting a move within self-play
   #           'num_epochs': 4,                  # number of epochs for training on self-play data for each iteration
   #           'batch_size': 128,                # batch size for training
-  #           'temperature': 1.25,                 # temperature for the softmax selection of moves
-  #           'C': 2,                      # the value of the constant policy
+  #           'temperature': 1.25,              # temperature for the softmax selection of moves
+  #           'C': 2,                           # the value of the constant policy
   #           'augment': False,                 # whether to augment the training data with flipped states
   #           'dirichlet_alpha': 0.3,           # the value of the dirichlet noise
   #           'dirichlet_epsilon': 0.25,        # the value of the dirichlet noise
@@ -199,11 +420,20 @@ defmodule MCTS do
   def search(board) do
     root = GameNode.start_link(%{board: board, visit_count: 1})
 
-    # {policy, value} = 
-    #   board
-    #   |> GameBoard.get_encoded_state()
-    #   |> Nx.new_axis(0)
-    #   |> then(&predict_fn.(params, &1))
+    # 1. Obter o estado codificado
+    encoded_board = GameBoard.get_encoded_board(board)
+    
+    # 2. Adicionar dimensão de batch (o .unsqueeze(0))
+    # Transforma {3, 6, 7} em {1, 3, 6, 7}
+    input_tensor = Nx.new_axis(encoded_board, 0)
+    
+    # 3. Executar a inferência
+    # O Axon.build retorna {init_fn, predict_fn}
+    # O 'params' contém os pesos treinados da rede
+    {init_fn, predict_fn} = Resnet.get_policy_inference_model()
+
+    params = init_fn.(input_tensor)
+    predict_fn.(params)
 
     # probabilities = 
     #   policy_logits
@@ -265,74 +495,8 @@ defmodule MCTS do
 end
 ```
 
-## Model ResNet
-
 ```elixir
-defmodule Resnet do
-  @num_hidden 128
-  @num_res_blocks 9
-  
-  def start_block do
-    Axon.input("input", shape: {nil, 3})
-    |> Axon.conv(@num_hidden, kernel_size: 3, padding: :same)
-    |> Axon.batch_norm()
-    |> Axon.relu()
-  end
-
-  def police_head(x) do
-    x
-    |> Axon.conv(32, kernel_size: 3, padding: :same)
-    |> Axon.batch_norm()
-    |> Axon.relu()
-    |> Axon.flatten()
-    |> Axon.dense(GameBoard.get_col_count(), kernel_initializer: :lecun_normal)
-  end
-
-  def value_head(x) do
-    x
-    |> Axon.conv(3, kernel_size: 3, padding: :same)
-    |> Axon.batch_norm()
-    |> Axon.relu()
-    |> Axon.flatten()
-    |> Axon.dense(1, kernel_initializer: :lecun_normal)
-    |> Axon.tanh()
-  end
-
-  def res_block(x, num_hidden) do
-    residual = x
-  
-    x =
-      x
-      |> Axon.conv(num_hidden, kernel_size: 3, padding: :same)
-      |> Axon.batch_norm()
-      |> Axon.relu()
-      |> Axon.conv(num_hidden, kernel_size: 3, padding: :same)
-      |> Axon.batch_norm()
-  
-    x
-    |> Axon.add(residual)
-    |> Axon.relu()
-  end
-
-  def build_base_model() do
-      start_block()
-      |> then(fn input -> 
-         Enum.reduce(1..@num_res_blocks, input, fn _, acc -> 
-           res_block(acc, @num_hidden) 
-         end)
-       end)
-  end
-  
-  def build_model_policy() do
-    build_base_model() |> police_head()
-  end
-
-  def build_model_value() do
-    build_base_model() |> value_head()
-  end
-end
-  
-
+MCTS.search(board)
 ```
 
 ## AlphaZero
@@ -341,19 +505,19 @@ end
 defmodule AlphaZero do
   @num_interactions 48
   
-  # def learn() do
-  #   Enum.reduce(1..@num_iterations, step, fn _, acc -> 
-  #       memory = []
+  def learn() do
+    Enum.reduce(1..@num_iterations, step, fn _, acc -> 
+        memory = []
         
-  #       # self.model.eval()
-  #       # for selfPlay_iteration in trange(self.args['num_selfPlay_iterations']):
-  #       #     memory += self.selfPlay()
+        # self.model.eval()
+        # for selfPlay_iteration in trange(self.args['num_selfPlay_iterations']):
+        #     memory += self.selfPlay()
             
-  #       # self.model.train()
-  #       # for epoch in trange(self.args['num_epochs']):
-  #       #     self.train(memory)
-  #   end)
-  # end
+        # self.model.train()
+        # for epoch in trange(self.args['num_epochs']):
+        #     self.train(memory)
+    end)
+  end
 
   def self_play() do
     memory = []
@@ -392,27 +556,7 @@ end
 ```
 
 ```elixir
-GameBoard.start_link()
-```
-
-```elixir
-new_board = GameBoard.create_new_board()
-```
-
-```elixir
-GameBoard.save_board(new_board)
-```
-
-```elixir
-%{board: board} = GameBoard.get_state()
-```
-
-```elixir
-GameBoard.get_valid_moves(board)
-```
-
-```elixir
-# AlphaZero.self_play(board)
+AlphaZero.learn()
 ```
 
 ```elixir
