@@ -783,25 +783,315 @@ end
 ```
 
 ```elixir
-game = Game.new()
+defmodule PlayLive do
+  def start do
+    frame = Kino.Frame.new()
+    Kino.render(frame)
 
-args = %{
-  num_iterations:        8,
-  num_selfplay_iterations: 100,
-  num_epochs:            4,
-  batch_size:            64,
-  temperature:           1.25,
-  learning_rate:         0.001,
-  num_mcts_searches:     60,
-  dirichlet_epsilon:     0.25,
-  dirichlet_alpha:       0.3,
-  c:                     2.0,
-  action_size:           game.action_size
-}
+    game = Game.new()
 
+    # botões de escolha
+    btn_train = Kino.Control.button("Treinar novo modelo")
+    btn_load  = Kino.Control.button("Carregar modelo salvo")
 
-ResNet.start_link(game, 9, 128, args.learning_rate)
-AlphaZero.start_link(%{args: args, game: game})
+    Kino.Frame.render(frame, Kino.Layout.grid([btn_train, btn_load], columns: 2))
 
-AlphaZero.learn()
+    Kino.listen(btn_train, fn _event ->      
+      Kino.Frame.render(frame, Kino.Markdown.new("**Treinando...**"))
+
+      args = %{
+        num_iterations:          3,
+        num_selfplay_iterations: 5,
+        num_epochs:              4,
+        batch_size:              64,
+        temperature:             1.25,
+        learning_rate:           0.001,
+        num_mcts_searches:       60,
+        dirichlet_epsilon:       0.25,
+        dirichlet_alpha:         0.3,
+        action_size:             game.action_size,
+        c:                       2.0
+      }
+
+      ensure_resnet(game, 9, 128, args.learning_rate)
+      {:ok, _} = AlphaZero.start_link(%{args: args, game: game})
+
+      AlphaZero.learn()
+
+      Kino.Frame.render(frame, Kino.Markdown.new("**Treino concluído!**"))
+      start_game(frame, game, args)
+    end)
+
+    Kino.listen(btn_load, fn _event ->
+      # lista modelos salvos
+      case File.ls("models") do
+        {:ok, files} ->
+          iterations =
+            files
+            |> Enum.filter(&String.starts_with?(&1, "params_"))
+            |> Enum.map(fn f ->
+              f
+              |> String.replace("params_", "")
+              |> String.replace(".nx", "")
+              |> String.to_integer()
+            end)
+            |> Enum.sort()
+
+          if iterations == [] do
+            Kino.Frame.render(frame, Kino.Markdown.new("**Nenhum modelo salvo encontrado.**"))
+          else
+            show_model_picker(frame, game, iterations)
+          end
+
+        {:error, _} ->
+          Kino.Frame.render(frame, Kino.Markdown.new("**Pasta models/ não encontrada.**"))
+      end
+    end)
+  end
+
+  defp show_model_picker(frame, game, iterations) do
+    buttons =
+      Enum.map(iterations, fn i ->
+        {Kino.Control.button("Modelo #{i}"), i}
+      end)
+
+    button_row =
+      buttons
+      |> Enum.map(fn {btn, _} -> btn end)
+      |> Kino.Layout.grid(columns: length(buttons))
+
+    Kino.Frame.render(frame, Kino.Markdown.new("**Escolha o modelo:**"))
+    Kino.Frame.append(frame, button_row)
+
+    Enum.each(buttons, fn {btn, iteration} ->
+      Kino.listen(btn, fn _event ->
+        args = %{
+          num_iterations:          8,
+          num_selfplay_iterations: 100,
+          num_epochs:              4,
+          batch_size:              64,
+          temperature:             1.25,
+          learning_rate:           0.001,
+          num_mcts_searches:       60,
+          dirichlet_epsilon:       0.25,
+          dirichlet_alpha:         0.3,
+          action_size:             game.action_size,
+          c:                       2.0
+        }
+
+        ensure_resnet(game, 9, 128, args.learning_rate)
+        ResNet.load(iteration)
+
+        Kino.Frame.render(frame, Kino.Markdown.new("**Modelo #{iteration} carregado!**"))
+        start_game(frame, game, args)
+      end)
+    end)
+  end
+
+  defp ensure_resnet(game, num_res_blocks, num_hidden, learning_rate) do
+    case Process.whereis(ResNet) do
+      nil -> :ok
+      pid -> Agent.stop(pid)
+    end
+  
+    {:ok, _} = ResNet.start_link(game, num_res_blocks, num_hidden, learning_rate)
+  end
+    
+defp start_game(frame, game, args) do
+  board = Game.get_initial_board(game)
+
+  try do Agent.stop(:play_state) catch _, _ -> :ok end
+
+  Agent.start_link(fn ->
+    %{board: board, game: game, args: args, game_over: false, ai_mode: :mcts}
+  end, name: :play_state)
+
+  board_frame = Kino.Frame.new()
+
+  # botões de coluna
+  buttons =
+    Enum.map(0..6, fn col ->
+      {Kino.Control.button("#{col}"), col}
+    end)
+
+  button_row =
+    buttons
+    |> Enum.map(fn {btn, _} -> btn end)
+    |> Kino.Layout.grid(columns: 7)
+
+  # botões de modo da IA
+  btn_mcts     = Kino.Control.button("IA forte (MCTS)")
+  btn_parallel = Kino.Control.button("IA forte paralela")
+  btn_raw      = Kino.Control.button("IA rápida (sem MCTS)")
+  btn_restart  = Kino.Control.button("Nova partida")
+
+  mode_row = Kino.Layout.grid([btn_mcts, btn_parallel, btn_raw], columns: 3)
+
+  Kino.Frame.render(frame, Kino.Layout.grid([
+    board_frame,
+    button_row,
+    mode_row,
+    btn_restart
+  ], columns: 1))
+
+  render_board(board_frame, board, "Sua vez (modo: MCTS):")
+
+  # listeners de modo
+  Kino.listen(btn_mcts, fn _event ->
+    Agent.update(:play_state, fn s -> %{s | ai_mode: :mcts} end)
+    state = Agent.get(:play_state, & &1)
+    render_board(board_frame, state.board, "Modo: MCTS")
+  end)
+
+  Kino.listen(btn_parallel, fn _event ->
+    Agent.update(:play_state, fn s -> %{s | ai_mode: :parallel} end)
+    state = Agent.get(:play_state, & &1)
+    render_board(board_frame, state.board, "Modo: MCTS paralelo")
+  end)
+
+  Kino.listen(btn_raw, fn _event ->
+    Agent.update(:play_state, fn s -> %{s | ai_mode: :raw} end)
+    state = Agent.get(:play_state, & &1)
+    render_board(board_frame, state.board, "Modo: rede neural pura")
+  end)
+
+  Kino.listen(btn_restart, fn _event ->
+    start_game(frame, game, args)
+  end)
+
+  Enum.each(buttons, fn {btn, col} ->
+    Kino.listen(btn, fn _event ->
+      state = Agent.get(:play_state, & &1)
+
+      if not state.game_over do
+        valid = Game.get_valid_moves(state.board) |> Nx.to_flat_list()
+
+        if Enum.at(valid, col) == 1 do
+          play_turn(board_frame, state.game, state.args, state.board, state.ai_mode, col)
+        end
+      end
+    end)
+  end)
+end
+
+defp play_turn(board_frame, game, args, board, ai_mode, col) do
+  board = Game.get_next_board(board, col, -1)
+
+  {value, is_terminal} = Game.get_value_and_terminated(game, board, col)
+
+  if is_terminal do
+    msg = if value == 1, do: "Você venceu!", else: "Empate!"
+    render_board(board_frame, board, msg)
+    Agent.update(:play_state, fn s -> %{s | board: board, game_over: true} end)
+  else
+    render_board(board_frame, board, "IA pensando...")
+
+    ai_action = get_ai_action(game, args, board, ai_mode)
+
+    board = Game.get_next_board(board, ai_action, 1)
+
+    {value, is_terminal} = Game.get_value_and_terminated(game, board, ai_action)
+
+    if is_terminal do
+      msg = if value == 1, do: "IA venceu!", else: "Empate!"
+      render_board(board_frame, board, msg)
+      Agent.update(:play_state, fn s -> %{s | board: board, game_over: true} end)
+    else
+      mode_label =
+        case ai_mode do
+          :mcts     -> "MCTS"
+          :parallel -> "MCTS paralelo"
+          :raw      -> "rede neural"
+        end
+
+      render_board(board_frame, board, "Sua vez — IA jogou coluna #{ai_action} (#{mode_label}):")
+      Agent.update(:play_state, fn s -> %{s | board: board} end)
+    end
+  end
+end
+
+defp get_ai_action(game, args, board, :mcts) do
+  neutral_board = Game.change_perspective(board, 1)
+  action_probs  = MCTS.search(%{args: args, game: game}, neutral_board)
+  action_probs |> Enum.with_index() |> Enum.max_by(fn {p, _} -> p end) |> elem(1)
+end
+
+defp get_ai_action(game, args, board, :parallel) do
+  neutral_board = Game.change_perspective(board, 1)
+  action_probs  = search_parallel(%{args: args, game: game}, neutral_board)
+  action_probs |> Enum.with_index() |> Enum.max_by(fn {p, _} -> p end) |> elem(1)
+end
+
+defp get_ai_action(_game, _args, board, :raw) do
+  neutral_board = Game.change_perspective(board, 1)
+
+  {policy, _value} =
+    neutral_board
+    |> Game.get_encoded_board()
+    |> Nx.new_axis(0)
+    |> ResNet.predict()
+
+  valid_moves = Game.get_valid_moves(board) |> Nx.to_flat_list()
+
+  policy
+  |> Axon.Activations.softmax(axis: 1)
+  |> Nx.squeeze(axes: [0])
+  |> Nx.to_flat_list()
+  |> Utils.mask_and_normalize(valid_moves)
+  |> Enum.with_index()
+  |> Enum.max_by(fn {p, _} -> p end)
+  |> elem(1)
+end
+
+defp search_parallel(%{args: args, game: game}, board, num_workers \\ 4) do
+  searches_per_worker = div(args.num_mcts_searches, num_workers)
+
+  results =
+    1..num_workers
+    |> Enum.map(fn _ ->
+      Task.async(fn ->
+        MCTS.search(
+          %{args: %{args | num_mcts_searches: searches_per_worker}, game: game},
+          board
+        )
+      end)
+    end)
+    |> Task.await_many(:infinity)
+
+  results
+  |> Enum.zip()
+  |> Enum.map(fn probs_tuple ->
+    probs_tuple
+    |> Tuple.to_list()
+    |> Enum.sum()
+    |> Kernel./(num_workers)
+  end)
+end
+  
+  defp render_board(frame, board, message) do
+    header = "| 0 | 1 | 2 | 3 | 4 | 5 | 6 |\n|---|---|---|---|---|---|---|"
+
+    rows =
+      board
+      |> Nx.to_list()
+      |> Enum.map(fn row ->
+        cells =
+          Enum.map(row, fn
+            1  -> "🔴"
+            -1 -> "🟡"
+            0  -> "⚪"
+          end)
+          |> Enum.join(" | ")
+
+        "| #{cells} |"
+      end)
+      |> Enum.join("\n")
+
+    Kino.Frame.render(frame, Kino.Markdown.new("**#{message}**\n\n#{header}\n#{rows}"))
+  end
+end
+```
+
+```elixir
+PlayLive.start()
 ```
