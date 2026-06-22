@@ -311,20 +311,54 @@ defmodule ResNet do
 def start_link(game, num_res_blocks, num_hidden, learning_rate) do
   model = build(game, num_res_blocks, num_hidden)
 
-  {init_fn, predict_fn} = Axon.build(model, mode: :inference)
+  {init_fn, predict_fn} = Axon.build(model, mode: :train)
   params = init_fn.(Nx.template({1, 3, game.row_count, game.col_count}, :f32), %Axon.ModelState{})
 
   {opt_init_fn, opt_update_fn} = Polaris.Optimizers.adam(learning_rate: learning_rate)
   opt_state = opt_init_fn.(params)
 
+  {_init_fn_infer, predict_fn_infer} = Axon.build(model, mode: :inference)
+
+  # Compile forward + loss + gradient + optimizer as a single XLA program.
+  # Calling predict_fn inside a separate value_and_grad causes nested EXLA compilation
+  # which fails because EXLA cannot accept symbolic Nx.Defn.Expr tensors as inputs.
+  train_fn = Nx.Defn.jit(
+    fn params, opt_state, state_tensor, policy_targets, value_targets ->
+      {loss, grads} =
+        Nx.Defn.value_and_grad(params, fn params ->
+          {out_policy, out_value} = predict_fn.(params, %{"state" => state_tensor})
+
+          policy_loss =
+            out_policy
+            |> Axon.Activations.log_softmax(axis: 1)
+            |> Nx.multiply(policy_targets)
+            |> Nx.sum(axes: [1])
+            |> Nx.mean()
+            |> Nx.negate()
+
+          value_loss =
+            out_value
+            |> Nx.subtract(value_targets)
+            |> Nx.pow(2)
+            |> Nx.mean()
+
+          Nx.add(policy_loss, value_loss)
+        end)
+
+      {new_params, new_opt_state} = opt_update_fn.(grads, opt_state, params)
+      {loss, new_params, new_opt_state}
+    end,
+    compiler: EXLA
+  )
+
   Agent.start_link(fn ->
     %{
-      model:         model,
-      params:        params,
-      predict_fn:    predict_fn,
-      opt_update_fn: opt_update_fn,
-      opt_state:     opt_state,
-      learning_rate: learning_rate
+      model:            model,
+      params:           params,
+      predict_fn_infer: predict_fn_infer,
+      train_fn:         train_fn,
+      opt_state:        opt_state,
+      learning_rate:    learning_rate
     }
   end, name: __MODULE__)
 end
@@ -332,10 +366,10 @@ end
   # ── inferência ─────────────────────────────────────────────────────────
 
   def predict(input) do
-    %{params: params, predict_fn: predict_fn} =
+    %{params: params, predict_fn_infer: predict_fn_infer} =
       Agent.get(__MODULE__, & &1)
 
-    predict_fn.(params, %{"state" => input})
+    predict_fn_infer.(params, %{"state" => input})
   end
 
   def get_params,    do: Agent.get(__MODULE__, & &1.params)
@@ -346,38 +380,11 @@ end
   # ── treinamento via Axon.Loop ──────────────────────────────────────────
 
 def train_step(state_tensor, policy_targets, value_targets) do
-  %{
-    params:        params,
-    predict_fn:    predict_fn,
-    opt_update_fn: opt_update_fn,
-    opt_state:     opt_state
-  } = Agent.get(__MODULE__, & &1)
+  %{params: params, opt_state: opt_state, train_fn: train_fn} =
+    Agent.get(__MODULE__, & &1)
 
-  # extrai predict_fn ANTES do value_and_grad
-  pf = predict_fn
-
-  {loss, gradients} =
-    Nx.Defn.value_and_grad(params, fn params ->
-      {out_policy, out_value} = pf.(params, %{"state" => state_tensor})
-
-      policy_loss =
-        out_policy
-        |> Axon.Activations.log_softmax(axis: 1)
-        |> Nx.multiply(policy_targets)
-        |> Nx.sum(axes: [1])
-        |> Nx.mean()
-        |> Nx.negate()
-
-      value_loss =
-        out_value
-        |> Nx.subtract(value_targets)
-        |> Nx.pow(2)
-        |> Nx.mean()
-
-      Nx.add(policy_loss, value_loss)
-    end)
-
-  {new_params, new_opt_state} = opt_update_fn.(gradients, opt_state, params)
+  {loss, new_params, new_opt_state} =
+    train_fn.(params, opt_state, state_tensor, policy_targets, value_targets)
 
   Agent.update(__MODULE__, fn state ->
     %{state | params: new_params, opt_state: new_opt_state}
