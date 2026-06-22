@@ -311,8 +311,8 @@ defmodule ResNet do
 def start_link(game, num_res_blocks, num_hidden, learning_rate) do
   model = build(game, num_res_blocks, num_hidden)
 
-  {init_fn, predict_fn} = Axon.build(model, mode: :inference, compiler: EXLA)
-  params = init_fn.(Nx.template({1, 3, game.row_count, game.col_count}, :f32), %{})
+  {init_fn, predict_fn} = Axon.build(model, mode: :inference)
+  params = init_fn.(Nx.template({1, 3, game.row_count, game.col_count}, :f32), %Axon.ModelState{})
 
   {opt_init_fn, opt_update_fn} = Polaris.Optimizers.adam(learning_rate: learning_rate)
   opt_state = opt_init_fn.(params)
