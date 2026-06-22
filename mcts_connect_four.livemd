@@ -2,19 +2,24 @@
 
 ```elixir
 Mix.install([
-  {:bumblebee, "~> 0.6.3"},
   {:nx, "~> 0.10.0"},
   {:axon, "~> 0.7.0"},
+  {:exla, "~> 0.10.0"},
   {:kino, "~> 0.19.0"},
-  {:torchx, "~> 0.10.0"},
-  {:uuid, "~> 1.1"}
-])
+  {:uuid, "~> 1.1"},
+  {:bumblebee, "~> 0.6"}
+], system_env: %{
+  "EXLA_CPU_ONLY" => "true",
+  "CFLAGS" => "-Wno-error -Wno-invalid-specialization",
+  "CXXFLAGS" => "-Wno-error -Wno-invalid-specialization"
+})
 ```
 
 ## Section
 
 ```elixir
-Nx.default_backend(Torchx.Backend)
+Nx.global_default_backend(EXLA.Backend)
+Nx.Defn.global_default_options(compiler: EXLA)
 ```
 
 ```elixir
@@ -303,21 +308,26 @@ end
 defmodule ResNet do
   import Axon
 
-  def start_link(game, num_res_blocks, num_hidden, learning_rate) do
-    model  = build(game, num_res_blocks, num_hidden)
+def start_link(game, num_res_blocks, num_hidden, learning_rate) do
+  model = build(game, num_res_blocks, num_hidden)
 
-    {init_fn, predict_fn} = Axon.build(model, mode: :inference)
-    params = init_fn.(Nx.template({1, 3, game.row_count, game.col_count}, :f32), %{})
+  {init_fn, predict_fn} = Axon.build(model, mode: :inference, compiler: EXLA)
+  params = init_fn.(Nx.template({1, 3, game.row_count, game.col_count}, :f32), %{})
 
-    Agent.start_link(fn ->
-      %{
-        model:         model,
-        params:        params,
-        predict_fn:    predict_fn,
-        learning_rate: learning_rate
-      }
-    end, name: __MODULE__)
-  end
+  {opt_init_fn, opt_update_fn} = Polaris.Optimizers.adam(learning_rate: learning_rate)
+  opt_state = opt_init_fn.(params)
+
+  Agent.start_link(fn ->
+    %{
+      model:         model,
+      params:        params,
+      predict_fn:    predict_fn,
+      opt_update_fn: opt_update_fn,
+      opt_state:     opt_state,
+      learning_rate: learning_rate
+    }
+  end, name: __MODULE__)
+end
 
   # ── inferência ─────────────────────────────────────────────────────────
 
@@ -335,41 +345,46 @@ defmodule ResNet do
 
   # ── treinamento via Axon.Loop ──────────────────────────────────────────
 
-  def train_step(state_tensor, policy_targets, value_targets) do
-    %{model: model, params: params, learning_rate: learning_rate} =
-      Agent.get(__MODULE__, & &1)
+def train_step(state_tensor, policy_targets, value_targets) do
+  %{
+    params:        params,
+    predict_fn:    predict_fn,
+    opt_update_fn: opt_update_fn,
+    opt_state:     opt_state
+  } = Agent.get(__MODULE__, & &1)
 
-    loss_fn = fn {out_policy, out_value}, {p_targets, v_targets} ->
+  # extrai predict_fn ANTES do value_and_grad
+  pf = predict_fn
+
+  {loss, gradients} =
+    Nx.Defn.value_and_grad(params, fn params ->
+      {out_policy, out_value} = pf.(params, %{"state" => state_tensor})
+
       policy_loss =
         out_policy
         |> Axon.Activations.log_softmax(axis: 1)
-        |> Nx.multiply(p_targets)
+        |> Nx.multiply(policy_targets)
         |> Nx.sum(axes: [1])
         |> Nx.mean()
         |> Nx.negate()
 
       value_loss =
         out_value
-        |> Nx.subtract(v_targets)
+        |> Nx.subtract(value_targets)
         |> Nx.pow(2)
         |> Nx.mean()
 
       Nx.add(policy_loss, value_loss)
-    end
-
-    new_params =
-      model
-      |> Axon.Loop.trainer(loss_fn, Polaris.Optimizers.adam(learning_rate: learning_rate))
-      |> Axon.Loop.run(
-        [{%{"state" => state_tensor}, {policy_targets, value_targets}}],
-        params,
-        epochs: 1
-      )
-
-    Agent.update(__MODULE__, fn state ->
-      %{state | params: new_params}
     end)
-  end
+
+  {new_params, new_opt_state} = opt_update_fn.(gradients, opt_state, params)
+
+  Agent.update(__MODULE__, fn state ->
+    %{state | params: new_params, opt_state: new_opt_state}
+  end)
+
+  Nx.to_number(loss)
+end
 
   # ── save / load ────────────────────────────────────────────────────────
 
@@ -394,7 +409,7 @@ defmodule ResNet do
     x = Enum.reduce(1..num_res_blocks, x, fn _i, x -> res_block(x, num_hidden) end)
 
     policy = policy_head(x, game)
-    value  = value_head(x, game)
+    value  = value_head(x)
 
     Axon.container({policy, value})
   end
@@ -428,7 +443,7 @@ defmodule ResNet do
     |> dense(game.action_size)
   end
 
-  defp value_head(x, game) do
+  defp value_head(x) do
     x
     |> conv(3, kernel_size: {3, 3}, padding: :same, use_bias: false)
     |> batch_norm()
@@ -800,13 +815,13 @@ defmodule PlayLive do
       Kino.Frame.render(frame, Kino.Markdown.new("**Treinando...**"))
 
       args = %{
-        num_iterations:          3,
-        num_selfplay_iterations: 5,
+        num_iterations:          24,
+        num_selfplay_iterations: 10,
         num_epochs:              4,
         batch_size:              64,
         temperature:             1.25,
         learning_rate:           0.001,
-        num_mcts_searches:       60,
+        num_mcts_searches:       10,
         dirichlet_epsilon:       0.25,
         dirichlet_alpha:         0.3,
         action_size:             game.action_size,
@@ -867,7 +882,7 @@ defmodule PlayLive do
       Kino.listen(btn, fn _event ->
         args = %{
           num_iterations:          8,
-          num_selfplay_iterations: 100,
+          num_selfplay_iterations: 10,
           num_epochs:              4,
           batch_size:              64,
           temperature:             1.25,
